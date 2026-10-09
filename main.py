@@ -8,6 +8,7 @@ import re
 import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import superinvestor
 
 load_dotenv()  # 같은 폴더의 .env 파일에서 비밀 값을 읽어옴 (.env는 git에 올라가지 않음)
 
@@ -50,6 +51,7 @@ DISCOUNT_THRESHOLD = 0.30   # 평균 대비 30% 이상 저렴할 때
 SEARCH_MONTHS_AHEAD    = 6
 CHECK_INTERVAL_MINUTES = 60   # 직항 + 유럽만이라 횟수 줄어서 60분으로 여유있게
 DAILY_BRIEFING_TIME    = "08:30"   # 매일 이 시간에 AI/LLM/테크 뉴스 브리핑 전송 (서버 타임존 기준)
+SUPERINVESTOR_TIME     = "09:00"   # 13F 공시 마감 직후(2·5·8·11월 16일) 이 시간에 슈퍼인베스터 컨센서스 전송
 
 # 관심 주제 뉴스 브리핑 설정 (카테고리별로 골고루 선별)
 NEWS_CATEGORIES = [
@@ -177,7 +179,8 @@ def send_startup_message():
         f"  · 150만원 이하\n"
         f"  · 또는 평균 대비 30% 이상 저렴\n"
         f"⏱ 체크 주기: {CHECK_INTERVAL_MINUTES}분마다\n"
-        f"🤖 AI/LLM/테크 뉴스 브리핑: 매일 {DAILY_BRIEFING_TIME} (카카오톡)\n\n"
+        f"🤖 AI/LLM/테크 뉴스 브리핑: 매일 {DAILY_BRIEFING_TIME} (카카오톡)\n"
+        f"🧠 슈퍼인베스터 13F 컨센서스: 2·5·8·11월 16일 {SUPERINVESTOR_TIME} (카카오톡)\n\n"
         f"특가 나오면 바로 알려드릴게요! 🔔"
     )
     send_telegram(msg)
@@ -395,6 +398,25 @@ def send_daily_briefing():
     log.info("일일 브리핑 전송 완료")
 
 
+def send_superinvestor_report():
+    """13F 공시 마감 직후에만 슈퍼인베스터 컨센서스 종목을 카카오톡으로 전송"""
+    if not superinvestor.is_report_day():
+        return
+
+    log.info("===== 슈퍼인베스터 13F 컨센서스 분석 (카카오톡) =====")
+    try:
+        messages = superinvestor.build_report()
+    except Exception as e:
+        log.error(f"슈퍼인베스터 분석 오류: {e}")
+        return
+
+    for msg in messages:
+        send_kakao(msg, link_url="https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=13F-HR")
+        time.sleep(random.uniform(1, 2))
+
+    log.info("슈퍼인베스터 컨센서스 전송 완료")
+
+
 def check_all_routes():
     log.info("===== 전체 노선 체크 시작 =====")
     dates = get_search_dates()
@@ -469,6 +491,7 @@ if __name__ == "__main__":
 
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check_all_routes)
     schedule.every().day.at(DAILY_BRIEFING_TIME).do(send_daily_briefing)
+    schedule.every().day.at(SUPERINVESTOR_TIME).do(send_superinvestor_report)
     while True:
         schedule.run_pending()
         time.sleep(30)
