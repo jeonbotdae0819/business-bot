@@ -17,6 +17,7 @@ import requests
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime
+from statistics import median
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -204,6 +205,75 @@ def lookup_tickers(cusips: list) -> dict:
     return tickers
 
 
+def fetch_yahoo(ticker: str, period: str):
+    """야후 파이낸스 일봉으로 (분기 평균가, 분기말 종가, 현재가) 조회 — 분할이 반영된 가격"""
+    end = datetime.strptime(period, "%Y-%m-%d")
+    start = datetime(end.year, end.month - 2, 1)   # 분기 첫날 (13F 기준일은 항상 분기말)
+    period_end = int(end.timestamp()) + 86400
+    resp = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker.replace('/', '-').replace('.', '-')}",
+        params={"period1": int(start.timestamp()),
+                "period2": int(time.time()), "interval": "1d"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    chart = resp.json()["chart"]["result"][0]
+    closes = [(ts, c) for ts, c in zip(chart.get("timestamp", []), chart["indicators"]["quote"][0].get("close", []))
+              if c is not None]
+    in_quarter = [c for ts, c in closes if ts < period_end]
+    if not in_quarter:
+        return None
+    current = chart.get("meta", {}).get("regularMarketPrice") or closes[-1][1]
+    return sum(in_quarter) / len(in_quarter), in_quarter[-1], current
+
+
+def fetch_stooq_price(ticker: str):
+    """야후 실패 시 Stooq에서 현재가만 조회"""
+    resp = requests.get("https://stooq.com/q/l/",
+                        params={"s": f"{ticker.lower().replace('/', '-')}.us", "f": "sd2t2ohlcv", "h": "", "e": "csv"},
+                        timeout=20)
+    resp.raise_for_status()
+    rows = [line.split(",") for line in resp.text.strip().splitlines()]
+    if len(rows) < 2 or "Close" not in rows[0]:
+        return None
+    value = rows[1][rows[0].index("Close")]
+    return float(value) if value not in ("N/D", "") else None
+
+
+def add_returns(stock: dict, period: str):
+    """추정 매수가(분기 평균가)·분기말 가격 대비 현재 수익률을 종목에 추가.
+    13F에는 실제 매수가가 없으므로 그 분기 평균가를 매수가로 추정함."""
+    stock.update({"buy_price": None, "qe_price": None, "price": None, "ret": None, "ret_qe": None})
+    if not stock["ticker"]:
+        return
+    try:
+        prices = fetch_yahoo(stock["ticker"], period)
+        if prices:
+            stock["buy_price"], stock["qe_price"], stock["price"] = prices
+    except Exception as e:
+        log.warning(f"{stock['ticker']} 야후 가격 조회 실패: {e}")
+
+    if stock["price"] is None:
+        # 대체 경로: 분기말 가격은 13F 평가액/주식 수의 중앙값, 현재가는 Stooq
+        try:
+            stock["price"] = fetch_stooq_price(stock["ticker"])
+        except Exception as e:
+            log.warning(f"{stock['ticker']} Stooq 가격 조회 실패: {e}")
+        if stock["price"] and stock["prices_13f"]:
+            qe = median(stock["prices_13f"])
+            if qe / stock["price"] > 200:   # 평가액을 천 달러 단위로 적은 공시 보정
+                qe /= 1000
+            stock["qe_price"] = qe
+
+    if stock["price"]:
+        if stock["buy_price"]:
+            stock["ret"] = stock["price"] / stock["buy_price"] - 1
+        if stock["qe_price"]:
+            stock["ret_qe"] = stock["price"] / stock["qe_price"] - 1
+    time.sleep(0.5)
+
+
 def analyze() -> dict:
     """모든 투자자의 최신·직전 13F를 비교해 컨센서스 매수/매도 종목을 계산"""
     if not SEC_USER_AGENT:
@@ -224,6 +294,9 @@ def analyze() -> dict:
     if not target:
         raise RuntimeError("분석할 13F 공시를 찾지 못했습니다")
 
+    def new_stock(cusip, name):
+        return {"cusip": cusip, "name": name, "buyers": [], "sellers": [], "holders": 0, "prices_13f": []}
+
     stocks = {}
     analyzed = 0
     for inv in investors:
@@ -243,14 +316,16 @@ def analyze() -> dict:
 
         for cusip, change in classify_changes(current, previous).items():
             name = (current.get(cusip) or previous.get(cusip))["name"]
-            s = stocks.setdefault(cusip, {"cusip": cusip, "name": name, "buyers": [], "sellers": [], "holders": 0})
+            s = stocks.setdefault(cusip, new_stock(cusip, name))
             if change in ("new", "add"):
                 s["buyers"].append((inv["label"], change == "new"))
             else:
                 s["sellers"].append((inv["label"], change == "sold"))
         for cusip, h in current.items():
-            stocks.setdefault(cusip, {"cusip": cusip, "name": h["name"], "buyers": [], "sellers": [], "holders": 0})
-            stocks[cusip]["holders"] += 1
+            s = stocks.setdefault(cusip, new_stock(cusip, h["name"]))
+            s["holders"] += 1
+            if h["shares"] > 0 and h["value"] > 0:
+                s["prices_13f"].append(h["value"] / h["shares"])
 
     def new_count(people):
         return sum(1 for _, flag in people if flag)
@@ -263,6 +338,7 @@ def analyze() -> dict:
     tickers = lookup_tickers([s["cusip"] for s in buys + sells])
     for s in buys + sells:
         s["ticker"] = tickers.get(s["cusip"], "")
+        add_returns(s, target)
 
     return {"period": target, "analyzed": analyzed, "buys": buys, "sells": sells}
 
@@ -277,11 +353,37 @@ def format_messages(result: dict) -> list:
     def title(s):
         return f"{s['name']} ({s['ticker']})" if s["ticker"] else s["name"]
 
+    def pct(r):
+        return f"{'🔴' if r < 0 else '🟢'} {r * 100:+.1f}%"
+
+    def return_line(s):
+        if s["price"] is None:
+            return "💵 현재가 조회 실패"
+        if s["ret"] is not None:
+            line = f"💵 추정 매수가 ${s['buy_price']:,.2f} → 현재 ${s['price']:,.2f} {pct(s['ret'])}"
+            if s["ret_qe"] is not None:
+                line += f"\n   (분기말 ${s['qe_price']:,.2f} 대비 {s['ret_qe'] * 100:+.1f}%)"
+            return line
+        if s["ret_qe"] is not None:
+            return f"💵 분기말 ${s['qe_price']:,.2f} → 현재 ${s['price']:,.2f} {pct(s['ret_qe'])}"
+        return f"💵 현재 ${s['price']:,.2f}"
+
+    def main_return(s):
+        return s["ret"] if s["ret"] is not None else s["ret_qe"]
+
+    priced = [s for s in result["buys"] if main_return(s) is not None]
+    losers = [s for s in priced if main_return(s) < 0]
+    summary = f"📊 지금 수익 🟢 {len(priced) - len(losers)}개 · 손실 🔴 {len(losers)}개"
+    if losers:
+        summary += "\n⚠️ 마이너스: " + ", ".join(
+            f"{s['ticker'] or s['name']} {main_return(s) * 100:+.1f}%" for s in sorted(losers, key=main_return))
+
     messages = [
         f"🧠 슈퍼인베스터 컨센서스\n"
         f"📅 {quarter_label(result['period'])} 13F (기준일 {result['period']})\n"
         f"👥 분석 투자자 {result['analyzed']}명\n"
         f"여러 거물이 동시에 산 종목 TOP {len(result['buys'])}"
+        + (f"\n{summary}" if priced else "")
     ]
 
     if not result["buys"]:
@@ -292,6 +394,7 @@ def format_messages(result: dict) -> list:
         messages.append(
             f"{i}. {title(s)}\n"
             f"🛒 매수 {len(s['buyers'])}명 (신규 {new}) · 📦 보유 {s['holders']}명\n"
+            f"{return_line(s)}\n"
             f"{names}"
         )
 
@@ -299,10 +402,14 @@ def format_messages(result: dict) -> list:
         lines = [f"📉 여러 거물이 동시에 판 종목"]
         for i, s in enumerate(result["sells"], 1):
             sold = sum(1 for _, is_sold in s["sellers"] if is_sold)
-            lines.append(f"{i}. {title(s)} — 매도 {len(s['sellers'])}명 (전량 {sold})")
+            line = f"{i}. {title(s)} — 매도 {len(s['sellers'])}명 (전량 {sold})"
+            if s["ret_qe"] is not None:
+                line += f"\n   판 뒤 주가 {pct(s['ret_qe'])}"
+            lines.append(line)
         messages.append("\n".join(lines))
 
-    messages.append("※ 13F는 분기말 보유 내역을 최대 45일 늦게 공개합니다. 그대로 따라 사기보다 종목 발굴용으로 활용하세요.")
+    messages.append("※ 13F에는 실제 매수가가 없어 그 분기 평균 주가를 매수가로 추정했습니다. "
+                    "13F는 분기말 보유 내역을 최대 45일 늦게 공개하니, 그대로 따라 사기보다 종목 발굴용으로 활용하세요.")
     return messages
 
 
