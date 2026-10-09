@@ -1,3 +1,6 @@
 .env
 __pycache__/
 *.pyc
+stock_screener/data_cache/
+stock_screener/output/
+.pytest_cache/

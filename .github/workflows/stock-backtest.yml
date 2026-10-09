@@ -1,0 +1,40 @@
+name: Stock screener & backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      market:
+        description: "다이버전스 비교 지수 (SPY 또는 QQQ)"
+        default: "SPY"
+  push:
+    paths:
+      - "stock_screener/**"
+      - "tests/**"
+      - ".github/workflows/stock-backtest.yml"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MARKET: ${{ github.event.inputs.market || 'SPY' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r stock_screener/requirements.txt pytest
+      - name: Unit tests
+        run: python -m pytest tests -q
+      - name: Screener
+        run: python -m stock_screener.screener --market "$MARKET" --start 2005-01-01 | tee screener.txt
+      - name: Backtest
+        run: python -m stock_screener.backtest --market "$MARKET" --compare | tee backtest.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stock-results
+          path: |
+            screener.txt
+            backtest.txt
+            stock_screener/output/
